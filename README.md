@@ -58,7 +58,6 @@ duo path --audio             # 🗺️ Play lesson audio out loud
 duo practice                 # 🦉 Start general global practice
 duo practice --audio         # 🦉 Start practice with audio enabled
 duo practice --type listen   # 👂 Listening-focused practice
-duo practice --type speak    # 🗣️ Speaking-focused practice
 ```
 
 ### Profile & Stats

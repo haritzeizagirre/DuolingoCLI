@@ -393,7 +393,7 @@ def path(audio: bool):
 @cli.command()
 @click.option(
     "--type", "-t", "session_type",
-    type=click.Choice(["practice", "listen", "speak"], case_sensitive=False),
+    type=click.Choice(["practice", "listen"], case_sensitive=False),
     default="practice",
     help="Type of session.",
 )
@@ -409,12 +409,10 @@ def practice(session_type: str, audio: bool):
     Session types:
       practice  — General practice (default)
       listen    — Listening-focused practice
-      speak     — Speaking-focused practice
     """
     type_map = {
         "practice": "GLOBAL_PRACTICE",
         "listen": "LISTENING_PRACTICE",
-        "speak": "SPEAKING_PRACTICE",
     }
 
     try:
