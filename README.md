@@ -18,7 +18,7 @@ This is an **unofficial** tool that uses reverse-engineered Duolingo API endpoin
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/DuolingoCLI.git
+git clone https://github.com/haritzeizagirre/DuolingoCLI.git
 cd DuolingoCLI
 
 # Install the CLI tool
