@@ -454,6 +454,7 @@ class DuolingoClient:
         level_session_index: Optional[int] = None,
         tree_id: Optional[str] = None,
         is_final_level: bool = False,
+        audio_enabled: bool = True,
     ) -> dict:
         """
         Start a new practice session.
@@ -478,8 +479,19 @@ class DuolingoClient:
         if not learning_language:
             learning_language = info.get("learningLanguage", "es")
 
+        # Determine challenge types
+        types = challenge_types or DEFAULT_CHALLENGE_TYPES.copy()
+        if not audio_enabled:
+            # Filter out all listening-based exercises
+            listen_types = {
+                "listen", "listenComplete", "listenMatch", "listenComprehension",
+                "listenIsolation", "listenTap", "radioListenMatch", "radioListenRecognize",
+                "syllableListenTap", "extendedListenMatch", "partialListen"
+            }
+            types = [t for t in types if t not in listen_types]
+
         body = {
-            "challengeTypes": challenge_types or DEFAULT_CHALLENGE_TYPES,
+            "challengeTypes": types,
             "fromLanguage": from_language,
             "isCustomIntroSkill": False,
             "isFinalLevel": is_final_level,

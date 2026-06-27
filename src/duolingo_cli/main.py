@@ -322,7 +322,7 @@ def path(audio: bool):
             
             if not skill_id:
                 print_warning(f"Found node '{title}' but it has no skill ID. Trying generic practice instead.")
-                session = client.start_practice_session()
+                session = client.start_practice_session(audio_enabled=audio)
             else:
                 section_idx = node.get("sectionIndex", "?")
                 unit_idx = node.get("unitIndex", "?")
@@ -343,6 +343,7 @@ def path(audio: bool):
                             level_session_index=attempt_lsi,
                             tree_id=node.get("treeId"),
                             is_final_level=node.get("isFinalLevel", False),
+                            audio_enabled=audio,
                         )
                         break  # success
                     except DuolingoAPIError:
@@ -352,7 +353,7 @@ def path(audio: bool):
                     print_warning("Duolingo's server rejected the path lesson request.")
                     print_info("Falling back to a Global Practice session instead.")
                     console.print()
-                    session = client.start_practice_session(session_type="GLOBAL_PRACTICE")
+                    session = client.start_practice_session(session_type="GLOBAL_PRACTICE", audio_enabled=audio)
 
             from .practice import run_practice_session
             results = run_practice_session(session, client, play_audio=audio)
@@ -431,7 +432,7 @@ def practice(session_type: str, audio: bool):
                 print_info(f"Course: {flag} {title}")
 
             api_type = type_map.get(session_type, "GLOBAL_PRACTICE")
-            session = client.start_practice_session(session_type=api_type)
+            session = client.start_practice_session(session_type=api_type, audio_enabled=audio)
 
             from .practice import run_practice_session
             results = run_practice_session(session, client, play_audio=audio)
