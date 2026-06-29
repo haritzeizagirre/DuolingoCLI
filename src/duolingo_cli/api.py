@@ -584,6 +584,8 @@ class DuolingoClient:
         # Inject pathLevelSpecifics from the node
         if path_level_specifics:
             body["pathLevelSpecifics"] = path_level_specifics.copy()
+            if body["pathLevelSpecifics"].get("lessonNumber") is None:
+                body["pathLevelSpecifics"]["lessonNumber"] = session.get("levelSessionIndex", 0) + 1
         elif "pathLevelSpecifics" not in body and "metadata" in session:
             md = session.get("metadata", {})
             body["pathLevelSpecifics"] = {
