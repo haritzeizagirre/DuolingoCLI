@@ -21,6 +21,13 @@ from __future__ import annotations
 
 import sys
 
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import click
 from rich.console import Console
 
@@ -318,42 +325,67 @@ def path(audio: bool):
                 return
             
             title = node.get("debugName", "Lesson")
-            skill_id = node.get("skillId")
-            
-            if not skill_id:
-                print_warning(f"Found node '{title}' but it has no skill ID. Trying generic practice instead.")
-                session = client.start_practice_session(audio_enabled=audio)
-            else:
-                section_idx = node.get("sectionIndex", "?")
-                unit_idx = node.get("unitIndex", "?")
-                print_info(f"Starting: Section {section_idx}, Unit {unit_idx} — {title}")
-                console.print()
-                session = None
-                level_session_index = node.get("levelSessionIndex", 0)
-                # Try levelSessionIndex and decrement once if server rejects it (500)
-                for attempt_lsi in [level_session_index, level_session_index - 1]:
-                    if attempt_lsi < 0:
-                        break
-                    try:
-                        session = client.start_practice_session(
-                            session_type="LESSON",
-                            skill_id=skill_id,
-                            level_id=node.get("levelId"),
-                            level_index=node.get("levelIndex"),
-                            level_session_index=attempt_lsi,
-                            tree_id=node.get("treeId"),
-                            is_final_level=node.get("isFinalLevel", False),
-                            audio_enabled=audio,
-                        )
-                        break  # success
-                    except DuolingoAPIError:
-                        continue
+            node_type = node.get("type", "skill")
+            subtype = node.get("subtype", "")
+            session_type = node.get("sessionType", "LESSON")
+            section_idx = node.get("sectionIndex", "?")
+            unit_idx = node.get("unitIndex", "?")
+            finished_sessions = node.get("finishedSessions", 0)
+            total_sessions = node.get("totalSessions", 1)
+            session_number = finished_sessions + 1
 
-                if session is None:
-                    print_warning("Duolingo's server rejected the path lesson request.")
-                    print_info("Falling back to a Global Practice session instead.")
-                    console.print()
-                    session = client.start_practice_session(session_type="GLOBAL_PRACTICE", audio_enabled=audio)
+            # Format descriptive label
+            if node_type == "practice":
+                if subtype == "unit_practice":
+                    type_label = f"Práctica de unidad ({session_number}/{total_sessions})"
+                else:
+                    type_label = f"Práctica personalizada ({session_number}/{total_sessions})"
+            elif node_type == "unit_review":
+                type_label = f"Repaso de unidad ({session_number}/{total_sessions})"
+            else:
+                type_label = f"Lección ({session_number}/{total_sessions})"
+
+            print_info(f"Starting: Section {section_idx}, Unit {unit_idx} — {type_label} [{title}]")
+            console.print()
+
+            session = None
+            level_session_index = node.get("levelSessionIndex", 0)
+            # Try levelSessionIndex and decrement once if server rejects it (500)
+            for attempt_lsi in [level_session_index, level_session_index - 1]:
+                if attempt_lsi < 0:
+                    break
+                    
+                is_final = node.get("isFinalLevel", False)
+                has_review = node.get("hasLevelReview", False)
+                
+                s_type = session_type
+                if node_type == "skill":
+                    s_type = "LEVEL_REVIEW" if (is_final and has_review and attempt_lsi == level_session_index) else "LESSON"
+                
+                try:
+                    session = client.start_practice_session(
+                        session_type=s_type,
+                        skill_id=node.get("skillId"),
+                        skill_ids=node.get("skillIds"),
+                        lexeme_practice_type=node.get("lexemePracticeType"),
+                        path_level_session_metadata=node.get("pathLevelSessionMetadata"),
+                        level_id=node.get("levelId"),
+                        level_index=node.get("levelIndex"),
+                        level_session_index=attempt_lsi,
+                        tree_id=node.get("treeId"),
+                        is_final_level=is_final,
+                        audio_enabled=audio,
+                    )
+                    session["_attempt_lsi"] = attempt_lsi
+                    break  # success
+                except DuolingoAPIError:
+                    continue
+
+            if session is None:
+                print_warning("Duolingo's server rejected the path lesson request.")
+                print_info("Falling back to a Global Practice session instead.")
+                console.print()
+                session = client.start_practice_session(session_type="GLOBAL_PRACTICE", audio_enabled=audio)
 
             from .practice import run_practice_session
             results = run_practice_session(session, client, play_audio=audio)
@@ -361,10 +393,16 @@ def path(audio: bool):
             # Try to complete the session on the server
             if len(results.get("answers", [])) > 0:
                 try:
+                    path_spec = node.get("pathLevelSpecifics")
+                    if path_spec:
+                        path_spec = path_spec.copy()
+                        if node.get("isFinalLevel", False):
+                            path_spec["nodeState"] = "completed"
+
                     client.complete_session(
                         session, 
                         results.get("answers", []), 
-                        path_level_specifics=node.get("pathLevelSpecifics"),
+                        path_level_specifics=path_spec,
                         hearts_left=results.get("hearts_left")
                     )
                     
@@ -372,6 +410,9 @@ def path(audio: bool):
                         print_warning("Lesson submitted as failed (out of hearts).")
                     else:
                         print_success("Lesson submitted to Duolingo! Progress saved. 🎉")
+                        if total_sessions > 1:
+                            new_fin = min(finished_sessions + 1, total_sessions)
+                            print_info(f"Node progress: {new_fin}/{total_sessions} completed.")
                 except Exception:
                     print_warning(
                         "Could not submit lesson to server. "

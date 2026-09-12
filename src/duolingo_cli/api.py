@@ -408,37 +408,77 @@ class DuolingoClient:
                 levels = unit.get("levels", [])
                 for level_idx, level in enumerate(levels):
                     if level.get("state") in ["active", "accessible"]:
-                        # Use pathLevelMetadata (not pathLevelClientData) — this is what
-                        # the browser sends as pathLevelSpecifics in the PUT payload.
                         metadata = level.get("pathLevelMetadata", {})
-                        skill_id = metadata.get("skillId")
-                        if not skill_id:
-                            client_data = level.get("pathLevelClientData", {})
-                            skill_id = client_data.get("skillId")
+                        client_data = level.get("pathLevelClientData", {})
+                        level_type = level.get("type", "skill")
+                        subtype = level.get("subtype", "regular")
 
-                        # Build pathLevelSpecifics exactly as the browser does:
-                        # from pathLevelMetadata + nodeState field
-                        path_level_specifics = {
-                            "skillId": metadata.get("skillId"),
-                            "crownLevelIndex": metadata.get("crownLevelIndex", 0),
-                            "treeId": metadata.get("treeId"),
-                            "nodeState": level.get("state", "active"),
-                            "lessonNumber": metadata.get("lessonNumber"),
-                        }
+                        skill_id = metadata.get("skillId") or client_data.get("skillId")
+                        skill_ids = client_data.get("skillIds", [])
+                        spaced_skill_ids = client_data.get("spacedRepetitionSkillIds", [])
+                        practice_type = client_data.get("practiceType")
+
+                        finished_sessions = level.get("finishedSessions", 0)
+                        total_sessions = level.get("totalSessions", 1)
+                        is_final = finished_sessions >= total_sessions - 1
+                        has_review = level.get("hasLevelReview", False)
+
+                        tree_id = metadata.get("treeId") or course.get("id")
+
+                        # Determine session type and parameters based on node type
+                        session_type = "LESSON"
+                        lexeme_practice_type = None
+                        chosen_skill_ids = None
+
+                        if level_type == "practice":
+                            if subtype == "unit_practice":
+                                session_type = "UNIT_PRACTICE"
+                                chosen_skill_ids = skill_ids
+                            elif practice_type == "SPACED_REPETITION" and spaced_skill_ids:
+                                session_type = "SPACED_REPETITION"
+                                chosen_skill_ids = spaced_skill_ids
+                            else:
+                                session_type = "LEXEME_PRACTICE"
+                                chosen_skill_ids = skill_ids
+                            lexeme_practice_type = "practice_level_review" if (is_final and has_review) else "practice_level"
+                        elif level_type == "unit_review":
+                            session_type = "UNIT_REVIEW"
+                            chosen_skill_ids = skill_ids
+                        elif level_type == "skill":
+                            if is_final and has_review:
+                                session_type = "LEVEL_REVIEW"
+                            else:
+                                session_type = "LESSON"
+
+                        # Preserve original pathLevelMetadata for pathLevelSpecifics
+                        path_level_specifics = dict(metadata)
+                        if "nodeState" not in path_level_specifics:
+                            path_level_specifics["nodeState"] = level.get("state", "active")
+                        if "treeId" not in path_level_specifics and tree_id and level_type != "unit_review":
+                            path_level_specifics["treeId"] = tree_id
 
                         return {
                             "id": level.get("id"),
-                            "type": level.get("type"),
+                            "type": level_type,
+                            "subtype": subtype,
                             "debugName": level.get("debugName"),
+                            "sessionType": session_type,
                             "skillId": skill_id,
+                            "skillIds": chosen_skill_ids or skill_ids,
+                            "lexemePracticeType": lexeme_practice_type,
                             "levelId": level.get("id"),
                             "levelIndex": metadata.get("crownLevelIndex", 0),
-                            "levelSessionIndex": level.get("finishedSessions", 0),
-                            "isFinalLevel": level.get("finishedSessions", 0) >= level.get("totalSessions", 1) - 1,
-                            "treeId": metadata.get("treeId") or course.get("id"),
+                            "levelSessionIndex": finished_sessions,
+                            "finishedSessions": finished_sessions,
+                            "totalSessions": total_sessions,
+                            "isFinalLevel": is_final,
+                            "hasLevelReview": has_review,
+                            "treeId": tree_id,
                             "pathLevelSpecifics": path_level_specifics,
+                            "pathLevelSessionMetadata": level.get("pathLevelSessionMetadata", {}),
                             "sectionIndex": section.get("index", 0) + 1,  # 1-indexed for display
                             "unitIndex": u_idx + 1,  # 1-indexed relative to section
+                            "unitTeachingObjective": unit.get("teachingObjective"),
                         }
         return None
 
@@ -449,6 +489,9 @@ class DuolingoClient:
         challenge_types: Optional[list[str]] = None,
         session_type: str = "GLOBAL_PRACTICE",
         skill_id: Optional[str] = None,
+        skill_ids: Optional[list[str]] = None,
+        lexeme_practice_type: Optional[str] = None,
+        path_level_session_metadata: Optional[dict] = None,
         level_id: Optional[str] = None,
         level_index: Optional[int] = None,
         level_session_index: Optional[int] = None,
@@ -465,8 +508,11 @@ class DuolingoClient:
             from_language: Interface language (e.g., "en")
             learning_language: Target language (e.g., "es")
             challenge_types: List of challenge types to include
-            session_type: "GLOBAL_PRACTICE", "LESSON", or "SKILL_PRACTICE"
+            session_type: "GLOBAL_PRACTICE", "LESSON", "LEXEME_PRACTICE", "UNIT_PRACTICE", etc.
             skill_id: Optional ID of the specific skill/lesson to start
+            skill_ids: Optional list of skill IDs for practice/review sessions
+            lexeme_practice_type: Optional "practice_level" or "practice_level_review"
+            path_level_session_metadata: Metadata dictionary from path level
             is_final_level: Whether this is the final session of the node
 
         Returns:
@@ -501,7 +547,7 @@ class DuolingoClient:
             "juicy": True,
             "learningLanguage": learning_language,
             "pathExperiments": PATH_EXPERIMENTS,
-            "pathLevelSessionMetadata": {},
+            "pathLevelSessionMetadata": path_level_session_metadata or {},
             "shakeToReportEnabled": True,
             "showGrammarSkillSplash": False,
             "smartTipsVersion": 2,
@@ -510,13 +556,18 @@ class DuolingoClient:
         
         if skill_id:
             body["skillId"] = skill_id
+        if skill_ids:
+            body["skillIds"] = skill_ids
+        if lexeme_practice_type:
+            body["lexemePracticeType"] = lexeme_practice_type
         if level_id is not None:
             body["levelId"] = level_id
         if level_index is not None:
             body["levelIndex"] = level_index
         if level_session_index is not None:
             body["levelSessionIndex"] = level_session_index
-        if tree_id is not None:
+        # Duolingo server returns 400 Invalid param: tree_id for UNIT_REVIEW sessions
+        if tree_id is not None and session_type != "UNIT_REVIEW":
             body["treeId"] = tree_id
 
         return self._post("/2017-06-30/sessions", json=body)
@@ -581,11 +632,19 @@ class DuolingoClient:
             "dailyRefreshInfo": None,
         }
         
+        # Ensure isFinalLevel is present if it's a review or if path specifies it
+        if session.get("isFinalLevel") or session.get("type", "").upper() == "LEVEL_REVIEW":
+            body["isFinalLevel"] = True
+        
         # Inject pathLevelSpecifics from the node
         if path_level_specifics:
             body["pathLevelSpecifics"] = path_level_specifics.copy()
-            if body["pathLevelSpecifics"].get("lessonNumber") is None:
-                body["pathLevelSpecifics"]["lessonNumber"] = session.get("levelSessionIndex", 0) + 1
+            # Only inject lessonNumber if skillId is present (regular lesson nodes)
+            if body["pathLevelSpecifics"].get("lessonNumber") is None and "skillId" in body["pathLevelSpecifics"]:
+                base_idx = session.get("_attempt_lsi", session.get("levelSessionIndex", 0))
+                body["pathLevelSpecifics"]["lessonNumber"] = base_idx + 1
+            if body.get("isFinalLevel"):
+                body["pathLevelSpecifics"]["nodeState"] = "completed"
         elif "pathLevelSpecifics" not in body and "metadata" in session:
             md = session.get("metadata", {})
             body["pathLevelSpecifics"] = {

@@ -36,13 +36,17 @@ from .ui import (
     console, print_success, print_error, print_info, get_flag,
 )
 
+_AUDIO_CACHE: dict[str, bytes] = {}
+
+
 def _play_audio_url(url: str):
-    """Download and play an audio URL using playsound."""
+    """Download and play an audio URL using playsound with memory cache."""
     if not url:
         return
     import urllib.request
     import tempfile
     import os
+    import sys
     try:
         from playsound import playsound
     except ImportError:
@@ -50,16 +54,353 @@ def _play_audio_url(url: str):
         return
         
     try:
+        data = _AUDIO_CACHE.get(url)
+        if not data:
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                data = response.read()
+            _AUDIO_CACHE[url] = data
+
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as f:
+            f.write(data)
             path = f.name
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response, open(path, 'wb') as f:
-            f.write(response.read())
-        playsound(path)
-        os.remove(path)
+
+        try:
+            playsound(path)
+        finally:
+            if sys.platform == "win32":
+                try:
+                    import ctypes
+                    ctypes.windll.winmm.mciSendStringW("close all", None, 0, 0)
+                except Exception:
+                    pass
+            try:
+                os.remove(path)
+            except Exception:
+                pass
     except Exception:
         # Silently fail if audio can't be played
         pass
+
+
+def _ask_with_audio_replay(
+    prompt_label: str,
+    tts: Optional[str] = None,
+    slow_tts: Optional[str] = None,
+    valid_answers: Optional[set] = None,
+    default: str = "",
+) -> str:
+    """Prompt user for input, allowing 'r' / ':r' to replay audio, or 's' / ':s' for slow audio."""
+    while True:
+        answer = Prompt.ask(prompt_label, default=default)
+        raw = answer.strip().lower()
+
+        # Check for replay command
+        if (tts or slow_tts) and raw in ("r", ":r", "replay", ":replay"):
+            if not (valid_answers and _normalize_text(answer) in valid_answers):
+                target = tts or slow_tts
+                console.print("  🎵 [dim]Playing audio again...[/dim]")
+                _play_audio_url(target)
+                console.print()
+                continue
+
+        # Check for slow replay command
+        if (slow_tts or tts) and raw in ("s", ":s", "slow", ":slow"):
+            if not (valid_answers and _normalize_text(answer) in valid_answers):
+                target = slow_tts or tts
+                label = "slow audio" if slow_tts else "audio"
+                console.print(f"  🎵 [dim]Playing {label}...[/dim]")
+                _play_audio_url(target)
+                console.print()
+                continue
+
+        return answer
+
+
+def _extract_solutions_from_grader(grader: dict, max_solutions: int = 2000) -> tuple[set[str], list[str]]:
+    """
+    Traverse Duolingo's grader graph (DAG) to extract valid solutions.
+    Returns:
+        (normalized_solutions_set, canonical_formatted_list)
+    """
+    vertices = grader.get("vertices", [])
+    if not vertices:
+        return set(), []
+
+    target = len(vertices) - 1
+    normalized_solutions = set()
+    canonical_formatted = []
+    seen_canonical = set()
+
+    # Pass 1: Extract canonical solutions (skipping typo edges)
+    def dfs_canonical(u, path_orig, path_lenient):
+        if len(canonical_formatted) >= max_solutions:
+            return
+        if u == target:
+            orig_str = "".join(path_orig).strip()
+            lenient_str = "".join(path_lenient).strip()
+            if orig_str and orig_str not in seen_canonical:
+                canonical_formatted.append(orig_str)
+                seen_canonical.add(orig_str)
+            norm = _normalize_text(orig_str) or _normalize_text(lenient_str)
+            if norm:
+                normalized_solutions.add(norm)
+            return
+
+        for edge in vertices[u]:
+            if edge.get("type") == "typo":
+                continue
+            to_node = edge.get("to")
+            if 0 <= to_node <= target:
+                orig_val = edge.get("orig") if edge.get("orig") is not None else edge.get("lenient", "")
+                lenient_val = edge.get("lenient", "")
+                dfs_canonical(to_node, path_orig + [orig_val], path_lenient + [lenient_val])
+
+    dfs_canonical(0, [], [])
+
+    # Pass 2: Also add lenient & typo paths so accepted minor typos also pass
+    def dfs_lenient(u, path_lenient, count):
+        if count[0] >= max_solutions:
+            return
+        if u == target:
+            norm = _normalize_text("".join(path_lenient))
+            if norm:
+                normalized_solutions.add(norm)
+            count[0] += 1
+            return
+
+        for edge in vertices[u]:
+            to_node = edge.get("to")
+            if 0 <= to_node <= target:
+                val = edge.get("lenient", "")
+                dfs_lenient(to_node, path_lenient + [val], count)
+
+    dfs_lenient(0, [], [0])
+
+    return normalized_solutions, canonical_formatted
+
+
+def _get_challenge_solutions(challenge: dict) -> tuple[set[str], str, list[str]]:
+    """
+    Extract all valid normalized answers, the primary expected answer,
+    and a list of canonical alternative answers for a challenge.
+
+    Returns:
+        (valid_answers_set, expected_primary_str, canonical_alternatives_list)
+    """
+    valid_answers = set()
+    canonical_solutions = []
+
+    # 1. Check correctSolutions
+    correct_solutions = challenge.get("correctSolutions") or []
+    for s in correct_solutions:
+        norm = _normalize_text(s)
+        if norm:
+            valid_answers.add(norm)
+        if s and s not in canonical_solutions:
+            canonical_solutions.append(s)
+
+    # 2. Check compactTranslations
+    compact = challenge.get("compactTranslations") or []
+    for group in compact:
+        if isinstance(group, list):
+            for item in group:
+                if isinstance(item, str):
+                    norm = _normalize_text(item)
+                    if norm:
+                        valid_answers.add(norm)
+                    if item and item not in canonical_solutions:
+                        canonical_solutions.append(item)
+        elif isinstance(group, str):
+            norm = _normalize_text(group)
+            if norm:
+                valid_answers.add(norm)
+            if group and group not in canonical_solutions:
+                canonical_solutions.append(group)
+
+    # 3. Check correctAnswers
+    correct_answers = challenge.get("correctAnswers") or []
+    for a in correct_answers:
+        norm = _normalize_text(a)
+        if norm:
+            valid_answers.add(norm)
+        if a and a not in canonical_solutions:
+            canonical_solutions.append(a)
+
+    # 4. Check grader DAG
+    grader = challenge.get("grader")
+    if grader:
+        g_norm, g_canon = _extract_solutions_from_grader(grader)
+        valid_answers.update(g_norm)
+        for cs in g_canon:
+            if cs not in canonical_solutions:
+                canonical_solutions.append(cs)
+
+    # 5. Check metadata best_solution
+    meta_best = (
+        challenge.get("metadata", {})
+        .get("challenge_construction_insights", {})
+        .get("best_solution")
+    )
+    if meta_best:
+        valid_answers.add(_normalize_text(meta_best))
+
+    # Determine primary expected solution
+    expected = (
+        correct_solutions[0] if correct_solutions else (
+            meta_best if meta_best else (
+                correct_answers[0] if correct_answers else (
+                    canonical_solutions[0] if canonical_solutions else (
+                        challenge.get("prompt", "?")
+                    )
+                )
+            )
+        )
+    )
+
+    return valid_answers, expected, canonical_solutions
+
+
+def _word_edit_distance(s1: str, s2: str) -> int:
+    """
+    Computes Damerau-Levenshtein distance between two normalized tokens
+    specifically checking if distance <= 1 (insertion, deletion, substitution, adjacent transposition).
+    Returns 0 for exact match, 1 for distance 1, or 2 for distance >= 2.
+    Mirrors Duolingo's client-side grading algorithm.
+    """
+    if s1 == s2:
+        return 0
+    l1, l2 = len(s1), len(s2)
+    if abs(l1 - l2) > 1:
+        return 2
+
+    # Let s1 be the longer string
+    if l2 > l1:
+        s1, s2 = s2, s1
+        l1, l2 = l2, l1
+
+    # Common prefix
+    r = 0
+    while r < l2 and s1[r] == s2[r]:
+        r += 1
+
+    if r == l2:
+        return 1 if l1 > l2 else 0
+
+    # Common suffix
+    i = 0
+    while i < l2 and s1[l1 - 1 - i] == s2[l2 - 1 - i]:
+        i += 1
+
+    # 1 insertion / deletion or 1 substitution:
+    if r + i + 1 >= l1:
+        return 1
+
+    # 1 adjacent transposition (swap):
+    if l1 == l2 and r + 1 < l1 and s1[r] == s2[r + 1] and s1[r + 1] == s2[r] and r + i + 2 == l1:
+        return 1
+
+    return 2
+
+
+def _evaluate_answer(
+    answer: str,
+    valid_answers: set[str],
+    expected: str,
+    canonical_solutions: list[str],
+) -> dict:
+    """
+    Evaluates user's answer against the valid answers and canonical solutions.
+    Handles:
+      1. Exact matches (including alternative solutions / synonyms).
+      2. Typo tolerance matching Duolingo rules:
+         - Damerau-Levenshtein distance <= 1 per word (insertion, deletion, substitution, transposition).
+         - Not allowed on 1- or 2-letter words (where 1 letter changes the word entirely).
+         - At most 1 typo in the whole sentence/phrase.
+         - Spacing differences (missing or extra space).
+    """
+    norm_answer = _normalize_text(answer)
+    norm_expected = _normalize_text(expected)
+
+    # 1. Exact match
+    if norm_answer in valid_answers:
+        another = expected if (norm_answer != norm_expected) else None
+        return {
+            "correct": True,
+            "answer": answer,
+            "expected": expected,
+            "another_solution": another,
+            "typo_info": None,
+        }
+
+    # 2. Check for single typo against candidate solutions
+    candidates = []
+    if expected:
+        candidates.append((expected, norm_expected))
+    for c in canonical_solutions:
+        cn = _normalize_text(c)
+        if cn != norm_expected:
+            candidates.append((c, cn))
+    for v in valid_answers:
+        if v != norm_expected and not any(cn == v for _, cn in candidates):
+            candidates.append((v, v))
+
+    u_tokens = norm_answer.split()
+
+    for orig_cand, c_norm in candidates:
+        c_tokens = c_norm.split()
+        # Same word count
+        if len(u_tokens) == len(c_tokens) and len(u_tokens) > 0:
+            typos = 0
+            typo_pair = None
+            for uw, cw in zip(u_tokens, c_tokens):
+                if uw == cw:
+                    continue
+                # In Duolingo, typos are not allowed on short words (< 3 letters)
+                if min(len(uw), len(cw)) < 3:
+                    typos = 99
+                    break
+                dist = _word_edit_distance(uw, cw)
+                if dist == 1:
+                    typos += 1
+                    typo_pair = (uw, cw)
+                else:
+                    typos = 99
+                    break
+
+            if typos == 1 and typo_pair:
+                another = expected if (c_norm != norm_expected) else None
+                typo_info = f"[bold]{typo_pair[1]}[/bold] [dim](you typed: [strikethrough]{typo_pair[0]}[/strikethrough])[/dim]"
+                return {
+                    "correct": True,
+                    "answer": answer,
+                    "expected": expected,
+                    "another_solution": another,
+                    "typo_info": typo_info,
+                }
+
+        # Extra / missing space
+        elif abs(len(u_tokens) - len(c_tokens)) == 1 and len(u_tokens) > 0 and len(c_tokens) > 0:
+            if "".join(u_tokens) == "".join(c_tokens):
+                another = expected if (c_norm != norm_expected) else None
+                typo_info = f"[bold]{orig_cand}[/bold]"
+                return {
+                    "correct": True,
+                    "answer": answer,
+                    "expected": expected,
+                    "another_solution": another,
+                    "typo_info": typo_info,
+                }
+
+    # 3. No match
+    return {
+        "correct": False,
+        "answer": answer,
+        "expected": expected,
+        "another_solution": None,
+        "typo_info": None,
+    }
+
 
 # Challenge types that we can handle in CLI
 SUPPORTED_TYPES = {
@@ -173,6 +514,12 @@ def run_practice_session(
         if result.get("correct"):
             correct += 1
             print_success("Correct! " + _random_encouragement())
+            typo_info = result.get("typo_info")
+            if typo_info:
+                console.print(f"  [dim yellow]💡 You have a typo:[/dim yellow] {typo_info}")
+            another = result.get("another_solution")
+            if another:
+                console.print(f"  [dim]Another correct solution:[/dim] [bold]{another}[/bold]")
         else:
             correct_answer = result.get("expected", "?")
             print_error(f"Wrong! The answer was: [bold]{correct_answer}[/bold]")
@@ -215,69 +562,52 @@ def _handle_challenge(challenge: dict, num: int, total: int, play_audio: bool = 
             _play_audio_url(tts)
 
     if ctype in ("translate",):
-        return _challenge_translate(challenge)
+        return _challenge_translate(challenge, play_audio=play_audio)
     elif ctype in ("judge",):
-        return _challenge_judge(challenge)
+        return _challenge_judge(challenge, play_audio=play_audio)
     elif ctype in ("select", "characterSelect", "selectTranscription", "selectPronunciation"):
-        return _challenge_select(challenge)
+        return _challenge_select(challenge, play_audio=play_audio)
     elif ctype in ("name",):
-        return _challenge_name(challenge)
+        return _challenge_name(challenge, play_audio=play_audio)
     elif ctype in ("assist", "reverseAssist"):
-        return _challenge_assist(challenge)
+        return _challenge_assist(challenge, play_audio=play_audio)
     elif ctype in ("match", "characterMatch", "listenMatch", "extendedMatch", "extendedListenMatch"):
-        return _challenge_match(challenge)
+        return _challenge_match(challenge, play_audio=play_audio)
     elif ctype in ("listenTap",):
-        return _challenge_word_bank(challenge)
+        return _challenge_word_bank(challenge, play_audio=play_audio)
     elif ctype in ("speak", "listenSpeak"):
-        return _challenge_speak(challenge)
+        return _challenge_speak(challenge, play_audio=play_audio)
     elif ctype in ("gapFill", "tapCloze", "tapComplete", "typeCloze", "typeComplete", "completeReverseTranslation", "partialReverseTranslate", "listenComplete"):
-        return _challenge_gap_fill(challenge)
+        return _challenge_gap_fill(challenge, play_audio=play_audio)
     elif ctype in ("form",):
-        return _challenge_form(challenge)
+        return _challenge_form(challenge, play_audio=play_audio)
     elif ctype in ("definition",):
-        return _challenge_definition(challenge)
+        return _challenge_definition(challenge, play_audio=play_audio)
     elif ctype in ("listen",):
-        return _challenge_listen(challenge)
+        return _challenge_listen(challenge, play_audio=play_audio)
     elif ctype in ("listenIsolation",):
-        return _challenge_listen_isolation(challenge)
+        return _challenge_listen_isolation(challenge, play_audio=play_audio)
     elif ctype in ("readComprehension", "writeComprehension"):
-        return _challenge_comprehension(challenge)
+        return _challenge_comprehension(challenge, play_audio=play_audio)
     elif ctype in ("dialogue",):
-        return _challenge_dialogue(challenge)
+        return _challenge_dialogue(challenge, play_audio=play_audio)
     elif ctype in ("freeResponse",):
-        return _challenge_free_response(challenge)
+        return _challenge_free_response(challenge, play_audio=play_audio)
     else:
-        return _challenge_generic(challenge)
+        return _challenge_generic(challenge, play_audio=play_audio)
 
 
-def _challenge_translate(challenge: dict) -> dict:
+def _challenge_translate(challenge: dict, play_audio: bool = False) -> dict:
     """Handle translation challenges (with optional word bank tiles)."""
     prompt = challenge.get("prompt", "")
     source_lang = challenge.get("sourceLanguage", "?")
     target_lang = challenge.get("targetLanguage", "?")
-    correct_solutions = challenge.get("correctSolutions", [])
-    compact = challenge.get("compactTranslations", [])
-    correct_answers = challenge.get("correctAnswers", [])
     choices = challenge.get("choices", [])  # word bank tiles if present
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
-    # Get all possible correct answers
-    valid_answers = set()
-    if correct_solutions:
-        valid_answers.update(_normalize_text(s) for s in correct_solutions)
-    if compact:
-        for group in compact:
-            if isinstance(group, list):
-                for item in group:
-                    if isinstance(item, str):
-                        valid_answers.add(_normalize_text(item))
-            elif isinstance(group, str):
-                valid_answers.add(_normalize_text(group))
-    if correct_answers:
-        valid_answers.update(_normalize_text(a) for a in correct_answers)
-
-    expected = correct_solutions[0] if correct_solutions else (
-        correct_answers[0] if correct_answers else "?"
-    )
+    # Get all possible correct answers and primary expected
+    valid_answers, expected, canonical = _get_challenge_solutions(challenge)
 
     console.print(Panel(
         f"  {get_flag(source_lang)} → {get_flag(target_lang)}\n\n"
@@ -286,6 +616,16 @@ def _challenge_translate(challenge: dict) -> dict:
         border_style=DUO_BLUE,
         padding=(1, 1),
     ))
+
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
 
     # If there are word bank tiles, show them
     if choices:
@@ -304,7 +644,12 @@ def _challenge_translate(challenge: dict) -> dict:
             console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
         console.print()
         console.print(f"  [dim]Type the numbers in order (e.g. '2 5 1') or type the full answer:[/dim]")
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]")
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+            valid_answers=valid_answers,
+        )
         # Try to resolve number choices to words
         parts = answer.strip().split()
         resolved_parts = []
@@ -316,16 +661,20 @@ def _challenge_translate(challenge: dict) -> dict:
                     resolved_parts.append(tiles[idx])
             answer = " ".join(resolved_parts)
     else:
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your translation[/{DUO_GREEN}]")
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your translation[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+            valid_answers=valid_answers,
+        )
 
-    is_correct = _normalize_text(answer) in valid_answers
-    return {"correct": is_correct, "answer": answer, "expected": expected}
+    return _evaluate_answer(answer, valid_answers, expected, canonical)
 
 
-def _challenge_word_bank(challenge: dict) -> dict:
+def _challenge_word_bank(challenge: dict, play_audio: bool = False) -> dict:
     """Handle word-bank tap challenges (listenTap, etc.).
     
-    Shows the sentence/prompt and a numbered list of word tiles.
+    Shows a numbered list of word tiles.
     The user picks the correct tiles in order by number.
     """
     prompt = challenge.get("prompt", "")
@@ -333,16 +682,27 @@ def _challenge_word_bank(challenge: dict) -> dict:
     correct_tokens = challenge.get("correctTokens", [])
     correct_indices = challenge.get("correctIndices", [])
     solution_translation = challenge.get("solutionTranslation", "")
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
-    # Build display: show audio note + sentence (since CLI has no audio)
-    panel_text = ""
-    if prompt:
-        panel_text += f"  🎵 [dim](Listen and tap)[/dim]\n\n  [bold]{prompt}[/bold]"
-    if solution_translation:
-        panel_text += f"\n\n  [dim]Translation: {solution_translation}[/dim]"
+    has_audio = play_audio and bool(tts or slow_tts)
+
+    # Build display:
+    # If audio is enabled, hide prompt and solution translation so the answer isn't spoiled!
+    if has_audio:
+        panel_text = "  🎵 [dim](Listen to the audio and select the words in order)[/dim]"
+    else:
+        # Fallback when audio is disabled or unavailable in CLI
+        panel_text = ""
+        if solution_translation:
+            panel_text += f"  🎵 [dim](Audio disabled — use translation to assemble words)[/dim]\n\n  [dim]Translation: {solution_translation}[/dim]"
+        elif prompt:
+            panel_text += f"  🎵 [dim](Audio disabled — sentence below)[/dim]\n\n  [bold]{prompt}[/bold]"
+        else:
+            panel_text = "  Select the correct words in order"
 
     console.print(Panel(
-        panel_text or "  Select the correct words in order",
+        panel_text,
         title=f"[{DUO_ORANGE}]🎵 Tap the Words[/{DUO_ORANGE}]",
         border_style=DUO_ORANGE,
         padding=(1, 1),
@@ -369,7 +729,34 @@ def _challenge_word_bank(challenge: dict) -> dict:
 
     console.print()
     console.print(f"  [dim]Enter the numbers of the correct tiles in order (e.g. '1 3 2'):[/dim]")
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your selection[/{DUO_GREEN}]")
+    
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    valid_answers_set, g_expected, canonical = _get_challenge_solutions(challenge)
+    expected_words = []
+    if correct_indices:
+        expected_words = [choices[i] if isinstance(choices[i], str) else choices[i].get("text", str(choices[i])) for i in correct_indices if 0 <= i < len(choices)]
+    elif correct_tokens:
+        expected_words = correct_tokens
+
+    if expected_words:
+        valid_answers_set.add(_normalize_text(" ".join(expected_words)))
+    if prompt:
+        valid_answers_set.add(_normalize_text(prompt))
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your selection[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+        valid_answers=valid_answers_set,
+    )
 
     # Parse the chosen indices
     try:
@@ -381,35 +768,35 @@ def _challenge_word_bank(challenge: dict) -> dict:
         chosen_orig_indices = [shuffled_choices[i][0] for i in chosen_display_indices if 0 <= i < len(shuffled_choices)]
         
         # In listenTap, there can be multiple valid orderings or just correct_indices
-        if correct_indices:
-            is_correct = chosen_orig_indices == correct_indices
-        elif correct_tokens:
-            is_correct = _normalize_text(answer_text) == _normalize_text(" ".join(correct_tokens))
+        if correct_indices and chosen_orig_indices == correct_indices:
+            is_correct = True
+        elif _normalize_text(answer_text) in valid_answers_set:
+            is_correct = True
+        elif correct_tokens and _normalize_text(answer_text) == _normalize_text(" ".join(correct_tokens)):
+            is_correct = True
         else:
             is_correct = False
     except (ValueError, IndexError):
         answer_text = answer
-        if correct_tokens:
-            is_correct = _normalize_text(answer) == _normalize_text(" ".join(correct_tokens))
-        else:
-            is_correct = False
+        is_correct = _normalize_text(answer) in valid_answers_set
 
-    expected_words = []
-    if correct_indices:
-        expected_words = [choices[i] if isinstance(choices[i], str) else choices[i].get("text", str(choices[i])) for i in correct_indices if 0 <= i < len(choices)]
+    if solution_translation:
+        console.print(f"  [dim]Translation: {solution_translation}[/dim]")
     
-    return {
-        "correct": is_correct,
-        "answer": answer_text,
-        "expected": " ".join(expected_words) if expected_words else " ".join(correct_tokens),
-    }
+    expected_str = " ".join(expected_words) if expected_words else (g_expected or prompt or " ".join(correct_tokens))
+    res = _evaluate_answer(answer_text, valid_answers_set, expected_str, canonical)
+    if is_correct:
+        res["correct"] = True
+    return res
 
 
-def _challenge_judge(challenge: dict) -> dict:
+def _challenge_judge(challenge: dict, play_audio: bool = False) -> dict:
     """Handle 'judge' challenges (pick the correct sentence)."""
     prompt = challenge.get("prompt", "")
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     console.print(Panel(
         f"  [bold]{prompt}[/bold]\n",
@@ -423,7 +810,21 @@ def _challenge_judge(challenge: dict) -> dict:
         console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
     console.print()
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+    )
 
     try:
         chosen_idx = int(answer) - 1
@@ -437,11 +838,13 @@ def _challenge_judge(challenge: dict) -> dict:
     return {"correct": is_correct, "answer": str(chosen_idx), "expected": f"{correct_idx + 1}) {expected_text}"}
 
 
-def _challenge_select(challenge: dict) -> dict:
+def _challenge_select(challenge: dict, play_audio: bool = False) -> dict:
     """Handle select-from-options challenges."""
     prompt = challenge.get("prompt", "")
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     console.print(Panel(
         f"  [bold]{prompt}[/bold]",
@@ -455,7 +858,21 @@ def _challenge_select(challenge: dict) -> dict:
         console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
     console.print()
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+    )
 
     try:
         chosen_idx = int(answer) - 1
@@ -468,21 +885,13 @@ def _challenge_select(challenge: dict) -> dict:
     return {"correct": is_correct, "answer": str(chosen_idx), "expected": f"{correct_idx + 1}) {expected_text}"}
 
 
-def _challenge_name(challenge: dict) -> dict:
+def _challenge_name(challenge: dict, play_audio: bool = False) -> dict:
     """Handle 'name this' challenges (type what you see/hear)."""
     prompt = challenge.get("prompt", "")
-    correct_solutions = challenge.get("correctSolutions", [])
-    correct_answers = challenge.get("correctAnswers", [])
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
-    valid = set()
-    if correct_solutions:
-        valid.update(_normalize_text(s) for s in correct_solutions)
-    if correct_answers:
-        valid.update(_normalize_text(a) for a in correct_answers)
-
-    expected = correct_solutions[0] if correct_solutions else (
-        correct_answers[0] if correct_answers else "?"
-    )
+    valid, expected, canonical = _get_challenge_solutions(challenge)
 
     console.print(Panel(
         f"  [bold]{prompt}[/bold]",
@@ -491,17 +900,32 @@ def _challenge_name(challenge: dict) -> dict:
         padding=(1, 1),
     ))
 
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]")
-    is_correct = _normalize_text(answer) in valid
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
 
-    return {"correct": is_correct, "answer": answer, "expected": expected}
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+        valid_answers=valid,
+    )
+    return _evaluate_answer(answer, valid, expected, canonical)
 
 
-def _challenge_assist(challenge: dict) -> dict:
+def _challenge_assist(challenge: dict, play_audio: bool = False) -> dict:
     """Handle 'assist' challenges (choose the meaning)."""
     prompt = challenge.get("prompt", "")
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     console.print(Panel(
         f"  What does this mean?\n\n  [bold]{prompt}[/bold]",
@@ -515,7 +939,21 @@ def _challenge_assist(challenge: dict) -> dict:
         console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
     console.print()
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+    )
 
     try:
         chosen_idx = int(answer) - 1
@@ -527,13 +965,15 @@ def _challenge_assist(challenge: dict) -> dict:
     return {"correct": is_correct, "answer": answer, "expected": f"{correct_idx + 1}) {expected_text}"}
 
 
-def _challenge_match(challenge: dict) -> dict:
+def _challenge_match(challenge: dict, play_audio: bool = False) -> dict:
     """Handle match challenges (pair items)."""
     pairs = challenge.get("pairs", [])
     correct_answers = challenge.get("correctAnswers", [])
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     if not pairs:
-        return _challenge_generic(challenge)
+        return _challenge_generic(challenge, play_audio=play_audio)
 
     # Show the pairs to match
     left_items = []
@@ -572,7 +1012,21 @@ def _challenge_match(challenge: dict) -> dict:
 
     console.print()
     console.print(f"  [dim]Enter matches like: 1A 2C 3B[/dim]")
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your matches[/{DUO_GREEN}]")
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your matches[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+    )
 
     # Parse and check
     correct_count = 0
@@ -596,13 +1050,17 @@ def _challenge_match(challenge: dict) -> dict:
     }
 
 
-def _challenge_gap_fill(challenge: dict) -> dict:
+def _challenge_gap_fill(challenge: dict, play_audio: bool = False) -> dict:
     """Handle gap fill / cloze challenges."""
+    ctype = challenge.get("type", "")
     prompt = challenge.get("displayTokens", [])
     correct_answers = challenge.get("correctAnswers", [])
     correct_solutions = challenge.get("correctSolutions", [])
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", -1)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
+    has_audio = play_audio and bool(tts or slow_tts)
 
     # Build display string and extract blank answers
     display_parts = []
@@ -628,9 +1086,12 @@ def _challenge_gap_fill(challenge: dict) -> dict:
         # In reverse translation gap fills, the prompt is the translation hint
         translation = challenge.get("prompt")
 
-    content = f"  [bold]{display_str}[/bold]"
-    if translation:
-        content += f"\n\n  [dim]Translation: {translation}[/dim]"
+    if ctype == "listenComplete" and has_audio:
+        content = f"  🎵 [dim](Listen and fill in the blank)[/dim]\n\n  [bold]{display_str}[/bold]"
+    else:
+        content = f"  [bold]{display_str}[/bold]"
+        if translation:
+            content += f"\n\n  [dim]Translation: {translation}[/dim]"
 
     # If it's a multiple choice gap fill
     if choices:
@@ -649,15 +1110,32 @@ def _challenge_gap_fill(challenge: dict) -> dict:
             correct_indices = [correct_idx]
             
         console.print()
+        if has_audio:
+            tip_parts = []
+            if tts:
+                tip_parts.append("'r' to replay")
+            if slow_tts:
+                tip_parts.append("'s' for slow")
+            if tip_parts:
+                console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
         if len(correct_indices) > 1:
-            answer = Prompt.ask(f"  [{DUO_GREEN}]Your choices (numbers, space separated)[/{DUO_GREEN}]")
+            answer = _ask_with_audio_replay(
+                f"  [{DUO_GREEN}]Your choices (numbers, space separated)[/{DUO_GREEN}]",
+                tts=tts if play_audio else None,
+                slow_tts=slow_tts if play_audio else None,
+            )
             try:
                 chosen_indices = [int(x.strip()) - 1 for x in answer.split()]
                 is_correct = chosen_indices == correct_indices
             except ValueError:
                 is_correct = False
         else:
-            answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+            answer = _ask_with_audio_replay(
+                f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+                tts=tts if play_audio else None,
+                slow_tts=slow_tts if play_audio else None,
+            )
             try:
                 chosen_idx = int(answer.strip()) - 1
                 is_correct = chosen_idx == (correct_indices[0] if correct_indices else -1)
@@ -676,22 +1154,18 @@ def _challenge_gap_fill(challenge: dict) -> dict:
         else:
             expected_str = f"{correct_indices[0]+1}) {expected_texts[0]}" if correct_indices else "?"
 
+        if translation and ctype == "listenComplete" and has_audio:
+            console.print(f"  [dim]Translation: {translation}[/dim]")
+
         return {"correct": is_correct, "answer": answer, "expected": expected_str}
 
     # If it's a text entry gap fill
-    valid = set()
-    if correct_answers:
-        valid.update(_normalize_text(a) for a in correct_answers)
-    if correct_solutions:
-        valid.update(_normalize_text(s) for s in correct_solutions)
+    valid, expected, canonical = _get_challenge_solutions(challenge)
     if blank_answers:
-        valid.update(_normalize_text(b) for b in blank_answers)
-
-    expected = correct_answers[0] if correct_answers else (
-        correct_solutions[0] if correct_solutions else (
-            blank_answers[0] if blank_answers else "?"
-        )
-    )
+        for b in blank_answers:
+            valid.add(_normalize_text(b))
+        if not expected or expected == "?":
+            expected = blank_answers[0]
 
     console.print(Panel(
         content,
@@ -700,33 +1174,64 @@ def _challenge_gap_fill(challenge: dict) -> dict:
         padding=(1, 1),
     ))
 
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Fill in[/{DUO_GREEN}]")
-    is_correct = _normalize_text(answer) in valid
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
 
-    return {"correct": is_correct, "answer": answer, "expected": expected}
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Fill in[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+        valid_answers=valid,
+    )
+    if translation and ctype == "listenComplete" and has_audio:
+        console.print(f"  [dim]Translation: {translation}[/dim]")
+
+    return _evaluate_answer(answer, valid, expected, canonical)
 
 
-def _challenge_form(challenge: dict) -> dict:
+def _challenge_form(challenge: dict, play_audio: bool = False) -> dict:
     """Handle form/conjugation challenges."""
     prompt = challenge.get("prompt", "")
     correct_solutions = challenge.get("correctSolutions", [])
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
+
+    console.print(Panel(
+        f"  [bold]{prompt}[/bold]",
+        title=f"[{DUO_PURPLE}]📋 Form[/{DUO_PURPLE}]",
+        border_style=DUO_PURPLE,
+        padding=(1, 1),
+    ))
+
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
 
     if choices:
-        console.print(Panel(
-            f"  [bold]{prompt}[/bold]",
-            title=f"[{DUO_PURPLE}]📋 Form[/{DUO_PURPLE}]",
-            border_style=DUO_PURPLE,
-            padding=(1, 1),
-        ))
-
         for i, choice in enumerate(choices):
             text = choice if isinstance(choice, str) else choice.get("text", str(choice))
             console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
         console.print()
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+        )
 
         try:
             chosen_idx = int(answer) - 1
@@ -737,24 +1242,23 @@ def _challenge_form(challenge: dict) -> dict:
         expected_text = choices[correct_idx] if isinstance(choices[correct_idx], str) else choices[correct_idx].get("text", "?")
         return {"correct": is_correct, "answer": answer, "expected": f"{correct_idx + 1}) {expected_text}"}
     else:
-        console.print(Panel(
-            f"  [bold]{prompt}[/bold]",
-            title=f"[{DUO_PURPLE}]📋 Form[/{DUO_PURPLE}]",
-            border_style=DUO_PURPLE,
-            padding=(1, 1),
-        ))
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]")
-        valid = set(_normalize_text(s) for s in correct_solutions) if correct_solutions else set()
-        expected = correct_solutions[0] if correct_solutions else "?"
-        is_correct = _normalize_text(answer) in valid
-        return {"correct": is_correct, "answer": answer, "expected": expected}
+        valid, expected, canonical = _get_challenge_solutions(challenge)
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+            valid_answers=valid,
+        )
+        return _evaluate_answer(answer, valid, expected, canonical)
 
 
-def _challenge_definition(challenge: dict) -> dict:
+def _challenge_definition(challenge: dict, play_audio: bool = False) -> dict:
     """Handle definition challenges."""
     prompt = challenge.get("prompt", "")
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     console.print(Panel(
         f"  What is the definition of:\n\n  [bold]{prompt}[/bold]",
@@ -768,7 +1272,21 @@ def _challenge_definition(challenge: dict) -> dict:
         console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
     console.print()
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+    )
 
     try:
         chosen_idx = int(answer) - 1
@@ -780,39 +1298,54 @@ def _challenge_definition(challenge: dict) -> dict:
     return {"correct": is_correct, "answer": answer, "expected": f"{correct_idx + 1}) {expected_text}"}
 
 
-def _challenge_listen(challenge: dict) -> dict:
-    """Handle listen challenges (type what you hear — no audio in CLI)."""
+def _challenge_listen(challenge: dict, play_audio: bool = False) -> dict:
+    """Handle listen challenges (type what you hear)."""
     prompt = challenge.get("prompt", "")
-    correct_solutions = challenge.get("correctSolutions", [])
-    correct_answers = challenge.get("correctAnswers", [])
-    # In CLI we show the sentence since there's no audio
+    solution_translation = challenge.get("solutionTranslation", "")
     tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
-    valid = set()
-    if correct_solutions:
-        valid.update(_normalize_text(s) for s in correct_solutions)
-    if correct_answers:
-        valid.update(_normalize_text(a) for a in correct_answers)
+    valid, expected, canonical = _get_challenge_solutions(challenge)
+    if prompt:
+        valid.add(_normalize_text(prompt))
+        if not expected or expected == "?":
+            expected = prompt
 
-    expected = correct_solutions[0] if correct_solutions else (
-        correct_answers[0] if correct_answers else "?"
-    )
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        panel_content = "  🎵 [dim](Listen to the audio and type what you hear)[/dim]"
+    else:
+        panel_content = f"  [dim]🔊 (Audio disabled in CLI — hint below)[/dim]\n\n  [bold italic]{prompt}[/bold italic]"
 
     console.print(Panel(
-        f"  [dim]🔊 (Audio not available in CLI — hint below)[/dim]\n\n"
-        f"  [bold italic]{prompt}[/bold italic]",
+        panel_content,
         title=f"[{DUO_ORANGE}]👂 Listen & Type[/{DUO_ORANGE}]",
         border_style=DUO_ORANGE,
         padding=(1, 1),
     ))
 
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Type what you hear[/{DUO_GREEN}]")
-    is_correct = _normalize_text(answer) in valid
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
 
-    return {"correct": is_correct, "answer": answer, "expected": expected}
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Type what you hear[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+        valid_answers=valid,
+    )
+    if solution_translation:
+        console.print(f"  [dim]Translation: {solution_translation}[/dim]")
+
+    return _evaluate_answer(answer, valid, expected, canonical)
 
 
-def _challenge_listen_isolation(challenge: dict) -> dict:
+def _challenge_listen_isolation(challenge: dict, play_audio: bool = False) -> dict:
     """Handle listenIsolation challenges (fill missing audio token)."""
     tokens = challenge.get("tokens", [])
     start = challenge.get("blankRangeStart", 0)
@@ -820,7 +1353,9 @@ def _challenge_listen_isolation(challenge: dict) -> dict:
     options = challenge.get("options", [])
     correct_idx = challenge.get("correctIndex", 0)
     translation = challenge.get("solutionTranslation", "")
-    
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
+
     display_parts = []
     for i, token in enumerate(tokens):
         if start <= i < end:
@@ -832,10 +1367,16 @@ def _challenge_listen_isolation(challenge: dict) -> dict:
             
     display_str = "".join(display_parts).strip()
     
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        panel_content = f"  🎵 [dim](Listen to the audio and select the missing word)[/dim]\n\n  [bold]{display_str}[/bold]"
+    else:
+        panel_content = f"  [dim]🎵 (Audio disabled in CLI)[/dim]\n\n  [bold]{display_str}[/bold]"
+        if translation:
+            panel_content += f"\n\n  [dim]Translation: {translation}[/dim]"
+
     console.print(Panel(
-        f"  [dim]🎵 (Audio missing in CLI)[/dim]\n\n"
-        f"  [bold]{display_str}[/bold]\n\n"
-        f"  [dim]Translation: {translation}[/dim]",
+        panel_content,
         title=f"[{DUO_ORANGE}]👂 Listen & Select[/{DUO_ORANGE}]",
         border_style=DUO_ORANGE,
         padding=(1, 1),
@@ -846,7 +1387,20 @@ def _challenge_listen_isolation(challenge: dict) -> dict:
         console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
     console.print()
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+    )
 
     try:
         chosen_idx = int(answer) - 1
@@ -855,16 +1409,20 @@ def _challenge_listen_isolation(challenge: dict) -> dict:
         is_correct = False
         chosen_idx = -1
 
+    if translation:
+        console.print(f"  [dim]Translation: {translation}[/dim]")
+
     expected_text = options[correct_idx] if isinstance(options[correct_idx], str) else options[correct_idx].get("text", "?")
-    # For options style guess, return the chosen index as a string
     return {"correct": is_correct, "answer": str(chosen_idx), "expected": f"{correct_idx + 1}) {expected_text}"}
 
 
-def _challenge_comprehension(challenge: dict) -> dict:
+def _challenge_comprehension(challenge: dict, play_audio: bool = False) -> dict:
     """Handle reading/writing comprehension."""
     prompt = challenge.get("prompt", "")
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     console.print(Panel(
         f"  [bold]{prompt}[/bold]",
@@ -873,13 +1431,27 @@ def _challenge_comprehension(challenge: dict) -> dict:
         padding=(1, 1),
     ))
 
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
     if choices:
         for i, choice in enumerate(choices):
             text = choice if isinstance(choice, str) else choice.get("text", str(choice))
             console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
 
         console.print()
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]")
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your choice (number)[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+        )
 
         try:
             chosen_idx = int(answer) - 1
@@ -890,20 +1462,24 @@ def _challenge_comprehension(challenge: dict) -> dict:
         expected_text = choices[correct_idx] if isinstance(choices[correct_idx], str) else choices[correct_idx].get("text", "?")
         return {"correct": is_correct, "answer": answer, "expected": f"{correct_idx + 1}) {expected_text}"}
     else:
-        correct_solutions = challenge.get("correctSolutions", [])
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]")
-        valid = set(_normalize_text(s) for s in correct_solutions) if correct_solutions else set()
-        expected = correct_solutions[0] if correct_solutions else "?"
-        is_correct = _normalize_text(answer) in valid
-        return {"correct": is_correct, "answer": answer, "expected": expected}
+        valid, expected, canonical = _get_challenge_solutions(challenge)
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+            valid_answers=valid,
+        )
+        return _evaluate_answer(answer, valid, expected, canonical)
 
 
-def _challenge_dialogue(challenge: dict) -> dict:
+def _challenge_dialogue(challenge: dict, play_audio: bool = False) -> dict:
     """Handle dialogue challenges."""
     prompt = challenge.get("prompt", "")
     dialogue_turns = challenge.get("dialogue", [])
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
     # Build the dialogue context: show all turns EXCEPT the last one,
     # because the last turn IS the correct answer (showing it would spoil it).
@@ -938,12 +1514,26 @@ def _challenge_dialogue(challenge: dict) -> dict:
         padding=(1, 1),
     ))
 
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
     if choices:
         for i, choice in enumerate(choices):
             text = choice if isinstance(choice, str) else choice.get("text", str(choice))
             console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
         console.print()
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your response (number)[/{DUO_GREEN}]")
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your response (number)[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+        )
         try:
             chosen_idx = int(answer) - 1
             is_correct = chosen_idx == correct_idx
@@ -952,24 +1542,16 @@ def _challenge_dialogue(challenge: dict) -> dict:
         expected_text = choices[correct_idx] if isinstance(choices[correct_idx], str) else choices[correct_idx].get("text", "?")
         return {"correct": is_correct, "answer": answer, "expected": f"{correct_idx + 1}) {expected_text}"}
     else:
-        return _challenge_generic(challenge)
+        return _challenge_generic(challenge, play_audio=play_audio)
 
 
-def _challenge_free_response(challenge: dict) -> dict:
+def _challenge_free_response(challenge: dict, play_audio: bool = False) -> dict:
     """Handle free response challenges."""
     prompt = challenge.get("prompt", "")
-    correct_solutions = challenge.get("correctSolutions", [])
-    correct_answers = challenge.get("correctAnswers", [])
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
 
-    valid = set()
-    if correct_solutions:
-        valid.update(_normalize_text(s) for s in correct_solutions)
-    if correct_answers:
-        valid.update(_normalize_text(a) for a in correct_answers)
-
-    expected = correct_solutions[0] if correct_solutions else (
-        correct_answers[0] if correct_answers else "?"
-    )
+    valid, expected, canonical = _get_challenge_solutions(challenge)
 
     console.print(Panel(
         f"  [bold]{prompt}[/bold]",
@@ -978,13 +1560,26 @@ def _challenge_free_response(challenge: dict) -> dict:
         padding=(1, 1),
     ))
 
-    answer = Prompt.ask(f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]")
-    is_correct = _normalize_text(answer) in valid
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
 
-    return {"correct": is_correct, "answer": answer, "expected": expected}
+    answer = _ask_with_audio_replay(
+        f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]",
+        tts=tts if play_audio else None,
+        slow_tts=slow_tts if play_audio else None,
+        valid_answers=valid,
+    )
+    return _evaluate_answer(answer, valid, expected, canonical)
 
 
-def _challenge_speak(challenge: dict) -> dict:
+def _challenge_speak(challenge: dict, play_audio: bool = False) -> dict:
     """Handle speak/listenSpeak challenges (no microphone in CLI — auto-accepted)."""
     prompt = challenge.get("prompt", "")
     correct_solutions = challenge.get("correctSolutions", [])
@@ -1010,7 +1605,7 @@ def _challenge_speak(challenge: dict) -> dict:
     return {"correct": True, "answer": expected, "expected": expected}
 
 
-def _challenge_generic(challenge: dict) -> dict:
+def _challenge_generic(challenge: dict, play_audio: bool = False) -> dict:
     """
     Fallback handler for unsupported challenge types.
     Shows available info and lets the user try to answer.
@@ -1019,8 +1614,10 @@ def _challenge_generic(challenge: dict) -> dict:
     prompt = challenge.get("prompt", "")
     choices = challenge.get("choices", [])
     correct_idx = challenge.get("correctIndex", 0)
-    correct_solutions = challenge.get("correctSolutions", [])
-    correct_answers = challenge.get("correctAnswers", [])
+    tts = challenge.get("tts", "")
+    slow_tts = challenge.get("slowTts", "")
+
+    valid, expected, canonical = _get_challenge_solutions(challenge)
 
     console.print(Panel(
         f"  [dim]Challenge type: {ctype}[/dim]\n\n  [bold]{prompt}[/bold]",
@@ -1029,35 +1626,42 @@ def _challenge_generic(challenge: dict) -> dict:
         padding=(1, 1),
     ))
 
+    has_audio = play_audio and bool(tts or slow_tts)
+    if has_audio:
+        tip_parts = []
+        if tts:
+            tip_parts.append("'r' to replay")
+        if slow_tts:
+            tip_parts.append("'s' for slow")
+        if tip_parts:
+            console.print(f"  [dim]💡 Tip: Type {' or '.join(tip_parts)}[/dim]")
+
     if choices:
         for i, choice in enumerate(choices):
             text = choice if isinstance(choice, str) else choice.get("text", str(choice))
             console.print(f"    [{DUO_BLUE}]{i + 1}[/{DUO_BLUE}]) {text}")
         console.print()
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your choice/answer[/{DUO_GREEN}]")
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your choice/answer[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+        )
         try:
             chosen_idx = int(answer) - 1
             is_correct = chosen_idx == correct_idx
         except ValueError:
-            valid = set()
-            if correct_solutions:
-                valid.update(_normalize_text(s) for s in correct_solutions)
-            if correct_answers:
-                valid.update(_normalize_text(a) for a in correct_answers)
             is_correct = _normalize_text(answer) in valid
     else:
-        answer = Prompt.ask(f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]")
-        valid = set()
-        if correct_solutions:
-            valid.update(_normalize_text(s) for s in correct_solutions)
-        if correct_answers:
-            valid.update(_normalize_text(a) for a in correct_answers)
-        is_correct = _normalize_text(answer) in valid
+        answer = _ask_with_audio_replay(
+            f"  [{DUO_GREEN}]Your answer[/{DUO_GREEN}]",
+            tts=tts if play_audio else None,
+            slow_tts=slow_tts if play_audio else None,
+            valid_answers=valid,
+        )
+        return _evaluate_answer(answer, valid, expected, canonical)
 
-    expected = correct_solutions[0] if correct_solutions else (
-        correct_answers[0] if correct_answers else "?"
-    )
-    return {"correct": is_correct, "answer": answer, "expected": expected}
+    another = expected if (is_correct and _normalize_text(answer) != _normalize_text(expected)) else None
+    return {"correct": is_correct, "answer": answer, "expected": expected, "another_solution": another}
 
 
 def _print_session_summary(correct: int, total: int, elapsed: float) -> None:
