@@ -25,7 +25,9 @@ cd DuolingoCLI
 pip install -e .
 ```
 
-> **Note:** To enable audio playback, `playsound` is required and installed by default.
+> **Note:**
+> - To enable audio playback, `playsound` is supported for listening exercises.
+> - **Windows Tip:** If the `duo` command is not recognized after installing, make sure your Python `Scripts` directory is in your Windows `PATH` environment variable (or install with `pipx install -e .`).
 
 ## 🔑 Authentication
 
